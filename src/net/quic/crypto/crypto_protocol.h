@@ -47,7 +47,6 @@ const QuicTag kC255 = TAG('C', '2', '5', '5');   // ECDH, Curve25519
 // AEAD algorithms
 const QuicTag kNULL = TAG('N', 'U', 'L', 'N');   // null algorithm
 const QuicTag kAESG = TAG('A', 'E', 'S', 'G');   // AES128 + GCM-12
-const QuicTag kCC12 = TAG('C', 'C', '1', '2');   // ChaCha20 + Poly1305
 const QuicTag kCC20 = TAG('C', 'C', '2', '0');   // ChaCha20 + Poly1305 RFC7539
 
 // Socket receive buffer
@@ -93,6 +92,8 @@ const QuicTag kAKD2 = TAG('A', 'K', 'D', '2');   // Ack decimation tolerating
                                                  // out of order packets.
 const QuicTag kSSLR = TAG('S', 'S', 'L', 'R');   // Slow Start Large Reduction.
 const QuicTag k5RTO = TAG('5', 'R', 'T', 'O');   // Close connection on 5 RTOs
+const QuicTag kCTIM = TAG('C', 'T', 'I', 'M');   // Client timestamp in seconds
+                                                 // since UNIX epoch.
 
 // Optional support of truncated Connection IDs.  If sent by a peer, the value
 // is the minimum number of bytes allowed for the connection ID sent to the

@@ -24,6 +24,7 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/thread_task_runner_handle.h"
 #include "base/time/time.h"
+#include "base/trace_event/trace_event.h"
 #include "base/values.h"
 #include "crypto/ec_private_key.h"
 #include "crypto/ec_signature_creator.h"
@@ -373,6 +374,8 @@ SpdyProtocolErrorDetails MapFramerErrorToProtocolError(
       return SPDY_ERROR_INVALID_CONTROL_FRAME_FLAGS;
     case SpdyFramer::SPDY_UNEXPECTED_FRAME:
       return SPDY_ERROR_UNEXPECTED_FRAME;
+    case SpdyFramer::SPDY_INVALID_CONTROL_FRAME_SIZE:
+      return SPDY_ERROR_INVALID_CONTROL_FRAME_SIZE;
     default:
       NOTREACHED();
       return static_cast<SpdyProtocolErrorDetails>(-1);
@@ -405,6 +408,8 @@ Error MapFramerErrorToNetError(SpdyFramer::SpdyError err) {
       return ERR_SPDY_PROTOCOL_ERROR;
     case SpdyFramer::SPDY_UNEXPECTED_FRAME:
       return ERR_SPDY_PROTOCOL_ERROR;
+    case SpdyFramer::SPDY_INVALID_CONTROL_FRAME_SIZE:
+      return ERR_SPDY_FRAME_SIZE_ERROR;
     default:
       NOTREACHED();
       return ERR_SPDY_PROTOCOL_ERROR;
@@ -657,11 +662,7 @@ bool SpdySession::CanPool(TransportSecurityState* transport_security_state,
   std::string pinning_failure_log;
   // DISABLE_PIN_REPORTS is set here because this check can fail in
   // normal operation without being indicative of a misconfiguration or
-  // attack.
-  //
-  // TODO(estark): replace 0 below with the port of the connection
-  // (though it won't actually be used since reports aren't getting
-  // sent).
+  // attack. Port is left at 0 as it is never used.
   if (!transport_security_state->CheckPublicKeyPins(
           HostPortPair(new_hostname, 0), ssl_info.is_issued_by_known_root,
           ssl_info.public_key_hashes, ssl_info.unverified_cert.get(),
@@ -1089,7 +1090,7 @@ void SpdySession::EnqueueStreamWrite(
   EnqueueWrite(stream->priority(), frame_type, std::move(producer), stream);
 }
 
-scoped_ptr<SpdyFrame> SpdySession::CreateSynStream(
+scoped_ptr<SpdySerializedFrame> SpdySession::CreateSynStream(
     SpdyStreamId stream_id,
     RequestPriority priority,
     SpdyControlFlags flags,
@@ -1104,7 +1105,7 @@ scoped_ptr<SpdyFrame> SpdySession::CreateSynStream(
   SpdyPriority spdy_priority =
       ConvertRequestPriorityToSpdyPriority(priority, GetProtocolVersion());
 
-  scoped_ptr<SpdyFrame> syn_frame;
+  scoped_ptr<SpdySerializedFrame> syn_frame;
   // TODO(hkhalil): Avoid copy of |block|.
   if (GetProtocolVersion() <= SPDY3) {
     SpdySynStreamIR syn_stream(stream_id);
@@ -1113,7 +1114,8 @@ scoped_ptr<SpdyFrame> SpdySession::CreateSynStream(
     syn_stream.set_fin((flags & CONTROL_FLAG_FIN) != 0);
     syn_stream.set_unidirectional((flags & CONTROL_FLAG_UNIDIRECTIONAL) != 0);
     syn_stream.set_header_block(block);
-    syn_frame.reset(buffered_spdy_framer_->SerializeFrame(syn_stream));
+    syn_frame.reset(new SpdySerializedFrame(
+        buffered_spdy_framer_->SerializeFrame(syn_stream)));
 
     if (net_log().IsCapturing()) {
       net_log().AddEvent(NetLog::TYPE_HTTP2_SESSION_SYN_STREAM,
@@ -1138,7 +1140,8 @@ scoped_ptr<SpdyFrame> SpdySession::CreateSynStream(
 
     headers.set_fin((flags & CONTROL_FLAG_FIN) != 0);
     headers.set_header_block(block);
-    syn_frame.reset(buffered_spdy_framer_->SerializeFrame(headers));
+    syn_frame.reset(new SpdySerializedFrame(
+        buffered_spdy_framer_->SerializeFrame(headers)));
 
     if (net_log().IsCapturing()) {
       net_log().AddEvent(
@@ -1246,7 +1249,7 @@ scoped_ptr<SpdyBuffer> SpdySession::CreateDataBuffer(SpdyStreamId stream_id,
 
   // TODO(mbelshe): reduce memory copies here.
   DCHECK(buffered_spdy_framer_.get());
-  scoped_ptr<SpdyFrame> frame(buffered_spdy_framer_->CreateDataFrame(
+  scoped_ptr<SpdySerializedFrame> frame(buffered_spdy_framer_->CreateDataFrame(
       stream_id, data->data(), static_cast<uint32_t>(effective_len), flags));
 
   scoped_ptr<SpdyBuffer> data_buffer(new SpdyBuffer(std::move(frame)));
@@ -1379,7 +1382,7 @@ void SpdySession::EnqueueResetStreamFrame(SpdyStreamId stream_id,
       base::Bind(&NetLogSpdyRstCallback, stream_id, status, &description));
 
   DCHECK(buffered_spdy_framer_.get());
-  scoped_ptr<SpdyFrame> rst_frame(
+  scoped_ptr<SpdySerializedFrame> rst_frame(
       buffered_spdy_framer_->CreateRstStream(stream_id, status));
 
   EnqueueSessionWrite(priority, RST_STREAM, std::move(rst_frame));
@@ -1387,6 +1390,7 @@ void SpdySession::EnqueueResetStreamFrame(SpdyStreamId stream_id,
 }
 
 void SpdySession::PumpReadLoop(ReadState expected_read_state, int result) {
+  TRACE_EVENT0("net", "SpdySession::PumpReadLoop");
   // TODO(bnc): Remove ScopedTracker below once crbug.com/462774 is fixed.
   tracked_objects::ScopedTracker tracking_profile(
       FROM_HERE_WITH_EXPLICIT_FUNCTION("462774 SpdySession::PumpReadLoop"));
@@ -1777,10 +1781,9 @@ void SpdySession::DoDrainSession(Error err, const std::string& description) {
     SpdyGoAwayIR goaway_ir(last_accepted_push_stream_id_,
                            MapNetErrorToGoAwayStatus(err),
                            description);
-    EnqueueSessionWrite(HIGHEST,
-                        GOAWAY,
-                        scoped_ptr<SpdyFrame>(
-                            buffered_spdy_framer_->SerializeFrame(goaway_ir)));
+    EnqueueSessionWrite(HIGHEST, GOAWAY,
+                        scoped_ptr<SpdySerializedFrame>(new SpdySerializedFrame(
+                            buffered_spdy_framer_->SerializeFrame(goaway_ir))));
   }
 
   availability_state_ = STATE_DRAINING;
@@ -1940,7 +1943,7 @@ int SpdySession::GetLocalAddress(IPEndPoint* address) const {
 
 void SpdySession::EnqueueSessionWrite(RequestPriority priority,
                                       SpdyFrameType frame_type,
-                                      scoped_ptr<SpdyFrame> frame) {
+                                      scoped_ptr<SpdySerializedFrame> frame) {
   DCHECK(frame_type == RST_STREAM || frame_type == SETTINGS ||
          frame_type == WINDOW_UPDATE || frame_type == PING ||
          frame_type == GOAWAY);
@@ -2194,10 +2197,9 @@ void SpdySession::OnSettings(bool clear_persisted) {
     SpdySettingsIR settings_ir;
     settings_ir.set_is_ack(true);
     EnqueueSessionWrite(
-        HIGHEST,
-        SETTINGS,
-        scoped_ptr<SpdyFrame>(
-            buffered_spdy_framer_->SerializeFrame(settings_ir)));
+        HIGHEST, SETTINGS,
+        scoped_ptr<SpdySerializedFrame>(new SpdySerializedFrame(
+            buffered_spdy_framer_->SerializeFrame(settings_ir))));
   }
 }
 
@@ -2832,10 +2834,10 @@ void SpdySession::SendInitialData() {
 
   if (send_connection_header_prefix_) {
     DCHECK_EQ(protocol_, kProtoHTTP2);
-    scoped_ptr<SpdyFrame> connection_header_prefix_frame(
-        new SpdyFrame(const_cast<char*>(kHttp2ConnectionHeaderPrefix),
-                      kHttp2ConnectionHeaderPrefixSize,
-                      false /* take_ownership */));
+    scoped_ptr<SpdySerializedFrame> connection_header_prefix_frame(
+        new SpdySerializedFrame(const_cast<char*>(kHttp2ConnectionHeaderPrefix),
+                                kHttp2ConnectionHeaderPrefixSize,
+                                false /* take_ownership */));
     // Count the prefix as part of the subsequent SETTINGS frame.
     EnqueueSessionWrite(HIGHEST, SETTINGS,
                         std::move(connection_header_prefix_frame));
@@ -2900,7 +2902,7 @@ void SpdySession::SendSettings(const SettingsMap& settings) {
       base::Bind(&NetLogSpdySendSettingsCallback, &settings, protocol_version));
   // Create the SETTINGS frame and send it.
   DCHECK(buffered_spdy_framer_.get());
-  scoped_ptr<SpdyFrame> settings_frame(
+  scoped_ptr<SpdySerializedFrame> settings_frame(
       buffered_spdy_framer_->CreateSettings(settings));
   sent_settings_ = true;
   EnqueueSessionWrite(HIGHEST, SETTINGS, std::move(settings_frame));
@@ -2975,14 +2977,14 @@ void SpdySession::SendWindowUpdateFrame(SpdyStreamId stream_id,
                                delta_window_size));
 
   DCHECK(buffered_spdy_framer_.get());
-  scoped_ptr<SpdyFrame> window_update_frame(
+  scoped_ptr<SpdySerializedFrame> window_update_frame(
       buffered_spdy_framer_->CreateWindowUpdate(stream_id, delta_window_size));
   EnqueueSessionWrite(priority, WINDOW_UPDATE, std::move(window_update_frame));
 }
 
 void SpdySession::WritePingFrame(SpdyPingId unique_id, bool is_ack) {
   DCHECK(buffered_spdy_framer_.get());
-  scoped_ptr<SpdyFrame> ping_frame(
+  scoped_ptr<SpdySerializedFrame> ping_frame(
       buffered_spdy_framer_->CreatePingFrame(unique_id, is_ack));
   EnqueueSessionWrite(HIGHEST, PING, std::move(ping_frame));
 

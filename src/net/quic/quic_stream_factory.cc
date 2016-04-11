@@ -19,6 +19,7 @@
 #include "base/strings/string_util.h"
 #include "base/strings/stringprintf.h"
 #include "base/thread_task_runner_handle.h"
+#include "base/trace_event/trace_event.h"
 #include "base/values.h"
 #include "net/base/ip_address.h"
 #include "net/base/net_errors.h"
@@ -64,6 +65,7 @@
 #endif
 
 using std::min;
+using std::vector;
 using NetworkHandle = net::NetworkChangeNotifier::NetworkHandle;
 
 namespace net {
@@ -133,10 +135,9 @@ class QuicStreamFactory::Job {
  public:
   Job(QuicStreamFactory* factory,
       HostResolver* host_resolver,
-      const HostPortPair& host_port_pair,
+      const QuicServerId& server_id,
       bool server_and_origin_have_same_host,
       bool was_alternative_service_recently_broken,
-      PrivacyMode privacy_mode,
       int cert_verify_flags,
       bool is_post,
       QuicServerInfo* server_info,
@@ -210,10 +211,9 @@ class QuicStreamFactory::Job {
 
 QuicStreamFactory::Job::Job(QuicStreamFactory* factory,
                             HostResolver* host_resolver,
-                            const HostPortPair& host_port_pair,
+                            const QuicServerId& server_id,
                             bool server_and_origin_have_same_host,
                             bool was_alternative_service_recently_broken,
-                            PrivacyMode privacy_mode,
                             int cert_verify_flags,
                             bool is_post,
                             QuicServerInfo* server_info,
@@ -221,7 +221,7 @@ QuicStreamFactory::Job::Job(QuicStreamFactory* factory,
     : io_state_(STATE_RESOLVE_HOST),
       factory_(factory),
       host_resolver_(host_resolver),
-      server_id_(host_port_pair, privacy_mode),
+      server_id_(server_id),
       cert_verify_flags_(cert_verify_flags),
       server_and_origin_have_same_host_(server_and_origin_have_same_host),
       is_post_(is_post),
@@ -267,6 +267,7 @@ int QuicStreamFactory::Job::Run(const CompletionCallback& callback) {
 }
 
 int QuicStreamFactory::Job::DoLoop(int rv) {
+  TRACE_EVENT0("net", "QuicStreamFactory::Job::DoLoop");
   do {
     IoState state = io_state_;
     io_state_ = STATE_NONE;
@@ -830,8 +831,7 @@ int QuicStreamFactory::Create(const HostPortPair& host_port_pair,
   if (quic_server_info_factory_.get()) {
     bool load_from_disk_cache = !disable_disk_cache_;
     MaybeInitialize();
-    if (!ContainsKey(quic_supported_servers_at_startup_,
-                     server_id.host_port_pair())) {
+    if (!ContainsKey(quic_supported_servers_at_startup_, host_port_pair)) {
       // If there is no entry for QUIC, consider that as a new server and
       // don't wait for Cache thread to load the data for that server.
       load_from_disk_cache = false;
@@ -842,10 +842,10 @@ int QuicStreamFactory::Create(const HostPortPair& host_port_pair,
   }
 
   bool server_and_origin_have_same_host = host_port_pair.host() == url.host();
-  scoped_ptr<Job> job(new Job(
-      this, host_resolver_, host_port_pair, server_and_origin_have_same_host,
-      WasQuicRecentlyBroken(server_id), privacy_mode, cert_verify_flags,
-      method == "POST" /* is_post */, quic_server_info, net_log));
+  scoped_ptr<Job> job(
+      new Job(this, host_resolver_, server_id, server_and_origin_have_same_host,
+              WasQuicRecentlyBroken(server_id), cert_verify_flags,
+              method == "POST" /* is_post */, quic_server_info, net_log));
   int rv = job->Run(base::Bind(&QuicStreamFactory::OnJobComplete,
                                base::Unretained(this), job.get()));
   if (rv == ERR_IO_PENDING) {
@@ -876,10 +876,10 @@ void QuicStreamFactory::CreateAuxilaryJob(const QuicServerId server_id,
                                           bool server_and_origin_have_same_host,
                                           bool is_post,
                                           const BoundNetLog& net_log) {
-  Job* aux_job = new Job(
-      this, host_resolver_, server_id.host_port_pair(),
-      server_and_origin_have_same_host, WasQuicRecentlyBroken(server_id),
-      server_id.privacy_mode(), cert_verify_flags, is_post, nullptr, net_log);
+  Job* aux_job =
+      new Job(this, host_resolver_, server_id, server_and_origin_have_same_host,
+              WasQuicRecentlyBroken(server_id), cert_verify_flags, is_post,
+              nullptr, net_log);
   active_jobs_[server_id].insert(aux_job);
   task_runner_->PostTask(FROM_HERE,
                          base::Bind(&QuicStreamFactory::Job::RunAuxilaryJob,
@@ -1514,6 +1514,7 @@ int QuicStreamFactory::CreateSession(const QuicServerId& server_id,
                                      base::TimeTicks dns_resolution_end_time,
                                      const BoundNetLog& net_log,
                                      QuicChromiumClientSession** session) {
+  TRACE_EVENT0("net", "QuicStreamFactory::CreateSession");
   IPEndPoint addr = *address_list.begin();
   bool enable_port_selection = enable_port_selection_;
   if (enable_port_selection && ContainsKey(gone_away_aliases_, server_id)) {
@@ -1709,12 +1710,18 @@ void QuicStreamFactory::MaybeInitialize() {
   if (http_server_properties_->max_server_configs_stored_in_properties() == 0)
     return;
   // Create a temporary QuicServerInfo object to deserialize and to populate the
-  // in-memory crypto server config cache.
+  // in-memory crypto server config cache in the MRU order.
   scoped_ptr<QuicServerInfo> server_info;
   CompletionCallback callback;
-  for (const auto& key_value :
-       http_server_properties_->quic_server_info_map()) {
-    const QuicServerId& server_id = key_value.first;
+  // Get the list of servers to be deserialized first because WaitForDataReady
+  // touches quic_server_info_map.
+  const QuicServerInfoMap& quic_server_info_map =
+      http_server_properties_->quic_server_info_map();
+  vector<QuicServerId> server_list(quic_server_info_map.size());
+  for (const auto& key_value : quic_server_info_map)
+    server_list.push_back(key_value.first);
+  for (auto it = server_list.rbegin(); it != server_list.rend(); ++it) {
+    const QuicServerId& server_id = *it;
     server_info.reset(quic_server_info_factory_->GetForServer(server_id));
     if (server_info->WaitForDataReady(callback) == OK) {
       DVLOG(1) << "Initialized server config for: " << server_id.ToString();
